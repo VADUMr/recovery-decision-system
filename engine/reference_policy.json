@@ -1,0 +1,48 @@
+{
+  "policy_name": "ECDM Severity-Aware Reference Recovery Policy",
+  "policy_version": "1.0",
+  "status": "frozen_for_confirmatory_campaign",
+  "scope": "Controlled ECDM fault-injection experiment only; thresholds are experiment-specific operating limits and are not universal production thresholds.",
+  "scenarios": {
+    "cpu": {
+      "severity_unit": "CPU load coefficient",
+      "rule_type": "threshold",
+      "threshold": 0.8,
+      "below_threshold_action": "Do Nothing",
+      "at_or_above_threshold_action": "Scale Out",
+      "rationale": "Moderate CPU pressure is observed without intervention; sustained high CPU pressure triggers capacity-oriented recovery."
+    },
+    "memory": {
+      "severity_unit": "allocated memory MB",
+      "rule_type": "threshold",
+      "threshold": 200,
+      "below_threshold_action": "Do Nothing",
+      "at_or_above_threshold_action": "Restart Service",
+      "rationale": "Lower synthetic memory pressure is treated conservatively; pressure at or above the experimental threshold triggers service restart semantics."
+    },
+    "latency": {
+      "severity_unit": "injected latency ms",
+      "rule_type": "threshold",
+      "threshold": 700,
+      "below_threshold_action": "Do Nothing",
+      "at_or_above_threshold_action": "Rollback",
+      "rationale": "Moderate transient delay is observed; higher injected delay triggers rollback to the stable configuration."
+    },
+    "errors": {
+      "severity_unit": "injected error probability",
+      "rule_type": "threshold",
+      "threshold": 0.2,
+      "below_threshold_action": "Do Nothing",
+      "at_or_above_threshold_action": "Rollback",
+      "rationale": "Low synthetic error probability is observed; error probability at or above the experimental threshold triggers rollback."
+    },
+    "dependency": {
+      "severity_unit": "dependency failure indicator",
+      "rule_type": "binary_failure",
+      "failure_value": 1.0,
+      "failure_action": "Restart Dependency",
+      "healthy_action": "Do Nothing",
+      "rationale": "A confirmed unavailable dependency is mapped to dependency-specific recovery."
+    }
+  }
+}

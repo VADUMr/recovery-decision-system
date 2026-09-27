@@ -1,0 +1,26 @@
+services:
+  app-service:
+    build: ./app
+    ports: ["8000:8000"]
+
+  dependency-service:
+    build: ./dependency
+    ports: ["8001:8001"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [app-service]
+
+  engine:
+    build: ./engine
+    environment:
+      APP_URL: http://app-service:8000
+      PROMETHEUS_URL: http://prometheus:9090
+      DATA_FILE: /data/pilot_results.csv
+    volumes:
+      - ./data:/data
+    ports: ["8100:8100"]
+    depends_on: [app-service, prometheus]
