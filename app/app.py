@@ -18,10 +18,11 @@ fault_state = {
 }
 _memory_ballast = []
 
-# --- CPU duty-cycle для обходу GIL ---
+# --- CPU: один duty-cycle потік замість N потоків (GIL робить "N потоків" марними) ---
 CPU_CYCLE_SECONDS = 1.0
 _cpu_stop_flag = threading.Event()
 _cpu_thread = None
+
 
 def _cpu_duty_cycle(severity):
     while not _cpu_stop_flag.is_set():
@@ -34,6 +35,7 @@ def _cpu_duty_cycle(severity):
         if idle_seconds > 0:
             _cpu_stop_flag.wait(timeout=idle_seconds)
 
+
 def set_cpu_load(severity):
     global _cpu_thread
     stop_cpu_load()
@@ -43,12 +45,14 @@ def set_cpu_load(severity):
     _cpu_thread = threading.Thread(target=_cpu_duty_cycle, args=(severity,), daemon=True)
     _cpu_thread.start()
 
+
 def stop_cpu_load():
     global _cpu_thread
     _cpu_stop_flag.set()
     if _cpu_thread is not None:
         _cpu_thread.join(timeout=1.0)
     _cpu_thread = None
+
 
 # --- Prometheus-метрики ---
 CPU_GAUGE = Gauge("ecdm_cpu_usage_percent", "Real measured CPU usage percent of this process (psutil)")
@@ -63,7 +67,8 @@ LATENCY_HIST = Histogram(
 )
 
 _PROCESS = psutil.Process()
-_PROCESS.cpu_percent()  # Ініціалізація вимірювання процесора
+_PROCESS.cpu_percent() # Праймінг-виклик для ініціалізації заміру
+
 
 @app.post("/fault")
 def set_fault():
@@ -95,6 +100,7 @@ def set_fault():
 
     return jsonify(status="ok", fault_state=fault_state)
 
+
 @app.get("/work")
 @LATENCY_HIST.time()
 def work():
@@ -114,6 +120,7 @@ def work():
 
     return jsonify(status="ok")
 
+
 @app.get("/metrics")
 def metrics():
     with state_lock:
@@ -127,6 +134,7 @@ def metrics():
     DEPENDENCY_GAUGE.set(0 if dependency_failure else 1)
 
     return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, threaded=True)
