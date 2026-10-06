@@ -2,6 +2,11 @@ services:
   app-service:
     build: ./app
     ports: ["8000:8000"]
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 1G
 
   dependency-service:
     build: ./dependency
@@ -20,6 +25,7 @@ services:
       APP_URL: http://app-service:8000
       PROMETHEUS_URL: http://prometheus:9090
       DATA_FILE: /data/pilot_results.csv
+      INCIDENT_DATA_FILE: /data/incident_results.csv
     volumes:
       - ./data:/data
     ports: ["8100:8100"]

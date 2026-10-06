@@ -1,6 +1,6 @@
 import requests
 
-print(">>> Запуск масштабної кампанії збору даних (це займе приблизно 30-35 хвилин)...")
+print(">>> Ну шо погнали")
 try:
     # Встановлюємо великий timeout (наприклад, 40 хвилин = 2400 секунд)
     response = requests.post("http://localhost:8100/campaign", timeout=2400)
