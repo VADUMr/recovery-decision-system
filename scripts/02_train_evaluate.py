@@ -1,3 +1,12 @@
+"""
+02_train_evaluate.py — GroupKFold training + decision-level metrics.
+
+Додано:
+  - success rate reference-policy дії (Policy SR)
+  - Regret = Policy SR − DSR_actual  (від'ємний = модель краща за policy)
+  - Brier score (калібрування ймовірностей)
+"""
+
 import os
 import warnings
 import numpy as np
@@ -10,7 +19,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, roc_curve, confusion_matrix, balanced_accuracy_score
+    roc_auc_score, roc_curve, confusion_matrix, balanced_accuracy_score,
+    brier_score_loss,
 )
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
@@ -47,12 +57,11 @@ leakage_cols = [
     "post_cpu", "post_memory", "post_latency_ms",
     "post_error_rate", "post_dependency_available", "post_availability",
 ]
-drop_extra = ["replicate"]  # службове поле
+drop_extra = ["replicate"]
 
 feature_cols = [c for c in df.columns if c not in leakage_cols + drop_extra]
 print(f"\n[INFO] Використовуємо фічі: {feature_cols}")
 
-# Кодування категоріальних
 label_encoders = {}
 df_enc = df.copy()
 for col in df_enc[feature_cols].select_dtypes(include=["object", "string"]).columns:
@@ -87,12 +96,12 @@ models = {
 # ============================================================
 gkf = GroupKFold(n_splits=5)
 results = []
-oof_store = {}          # name -> (y_true, y_pred, y_proba)
+oof_store = {}
 best_name, best_f1 = None, -1
 best_oof_proba = None
 
 for name, model in models.items():
-    accs, precs, recs, f1s, bal_accs, aucs = [], [], [], [], [], []
+    accs, precs, recs, f1s, bal_accs, aucs, briers = [], [], [], [], [], [], []
     oof_pred = np.zeros(len(df_enc), dtype=int)
     oof_proba = np.zeros(len(df_enc))
 
@@ -116,6 +125,7 @@ for name, model in models.items():
             aucs.append(roc_auc_score(y_te, proba))
         except ValueError:
             aucs.append(np.nan)
+        briers.append(brier_score_loss(y_te, proba))
 
     mean_f1 = float(np.mean(f1s))
     results.append({
@@ -126,6 +136,7 @@ for name, model in models.items():
         "F1-score, %": round(mean_f1 * 100, 2),
         "Balanced Accuracy, %": round(np.mean(bal_accs) * 100, 2),
         "ROC-AUC": round(np.nanmean(aucs), 3),
+        "Brier": round(np.mean(briers), 4),
     })
     oof_store[name] = (y.values, oof_pred, oof_proba)
 
@@ -140,39 +151,56 @@ print(results_df.to_string(index=False))
 print(f"\n[INFO] Найкраща модель за F1-score: {best_name}")
 
 # ============================================================
-# 5. Decision Success Rate (decision-level)
+# 5. Decision-level метрики: DSR + Policy SR + Regret
 # ============================================================
 df_enc["pred_proba"] = best_oof_proba
 
-best_actions = (
-    df_enc.loc[df_enc.groupby("incident_group_id")["pred_proba"].idxmax()]
-    [["incident_group_id", "candidate_action", "expected_decision",
-      "recovery_success", "pred_proba", "scenario"]]
-    .copy()
-)
+# --- 5a. Дія, обрана моделлю (argmax P̂) ---
+best_idx = df_enc.groupby("incident_group_id")["pred_proba"].idxmax()
+model_choices = df.loc[best_idx].copy()
+model_choices = model_choices[
+    ["incident_group_id", "candidate_action", "expected_decision",
+     "recovery_success", "scenario"]
+]
+model_choices["pred_proba"] = best_oof_proba[best_idx.values]
 
-# Порівняння з expected_decision (в закодованому просторі)
-if "candidate_action" in label_encoders:
-    le = label_encoders["candidate_action"]
-    # expected_decision може бути не в тому ж енкодері, якщо не кодували
-    # Тому беремо оригінальний df
-    orig_best = df.loc[best_actions.index]
-    dsr_decision = (
-        orig_best["candidate_action"].values == orig_best["expected_decision"].values
-    ).mean() * 100
-else:
-    dsr_decision = (
-        best_actions["candidate_action"] == best_actions["expected_decision"]
-    ).mean() * 100
+dsr_policy_match = (
+    model_choices["candidate_action"].values == model_choices["expected_decision"].values
+).mean() * 100
+dsr_actual = model_choices["recovery_success"].mean() * 100
+n_groups = len(model_choices)
+mean_p = model_choices["pred_proba"].mean()
 
-dsr_actual = best_actions["recovery_success"].mean() * 100
-n_groups = len(best_actions)
+# --- 5b. Success rate саме reference-policy дії ---
+# Для кожної групи знаходимо рядок, де candidate_action == expected_decision
+policy_rows = df[df["candidate_action"] == df["expected_decision"]].copy()
+# якщо в групі кілька збігів (не повинно), беремо перший
+policy_rows = policy_rows.groupby("incident_group_id", as_index=False).first()
+policy_sr = policy_rows["recovery_success"].mean() * 100
+n_policy = len(policy_rows)
+
+# --- 5c. Regret (в процентних пунктах) ---
+# Regret = Policy_SR − DSR_actual
+#   > 0  → policy краща за модель
+#   < 0  → модель краща за policy (типовий бажаний випадок)
+regret_pp = policy_sr - dsr_actual
 
 print(f"\n--- Decision-level метрики ({best_name}) ---")
-print(f"DSR (збіг з expected_decision):     {dsr_decision:.2f}%")
-print(f"DSR (реальний успіх вибраної дії):  {dsr_actual:.2f}%")
-print(f"Кількість інцидентів (груп):        {n_groups}")
-print(f"Середня P(success) вибраної дії:    {best_actions['pred_proba'].mean():.3f}")
+print(f"DSR (збіг з expected_decision):          {dsr_policy_match:.2f}%")
+print(f"DSR (реальний успіх вибраної дії):       {dsr_actual:.2f}%")
+print(f"Policy SR (успіх дії reference policy):  {policy_sr:.2f}%  (n={n_policy})")
+print(f"Regret (Policy SR − DSR_actual):         {regret_pp:+.2f} п.п.")
+print(f"Кількість інцидентів (груп):             {n_groups}")
+print(f"Середня P̂(success) вибраної дії:         {mean_p:.3f}")
+
+brier_best = results_df.loc[results_df["Model"] == best_name, "Brier"].values[0]
+print(f"Brier score ({best_name}):               {brier_best:.4f}  (0 = ідеал)")
+
+if mean_p > 0.95 and brier_best > 0.08:
+    print("[WARN] Висока середня P̂ при непоганому Brier — можлива надмірна "
+          "самовпевненість; розгляньте CalibratedClassifierCV.")
+elif brier_best <= 0.08:
+    print("[INFO] Brier score низький — ймовірності загалом добре відкалібровані.")
 
 # ============================================================
 # 6. Візуалізації
@@ -180,18 +208,18 @@ print(f"Середня P(success) вибраної дії:    {best_actions['pre
 palette = sns.color_palette("mako", n_colors=len(models))
 model_names = list(models.keys())
 
-# ----- 6.1 Фінальна таблиця як картинка -----
-fig, ax = plt.subplots(figsize=(11, 2.2))
+# ----- 6.1 Фінальна таблиця -----
+fig, ax = plt.subplots(figsize=(12, 2.4))
 ax.axis("off")
 tbl = ax.table(
-    cellText=results_df.round(3).values,
+    cellText=results_df.round(4).values,
     colLabels=results_df.columns,
     loc="center",
     cellLoc="center",
 )
 tbl.auto_set_font_size(False)
-tbl.set_fontsize(9)
-tbl.scale(1.15, 1.6)
+tbl.set_fontsize(8.5)
+tbl.scale(1.12, 1.55)
 for (row, col), cell in tbl.get_celld().items():
     if row == 0:
         cell.set_facecolor("#2c3e50")
@@ -204,7 +232,7 @@ plt.tight_layout()
 plt.savefig("data/plots/table1_model_comparison.png", bbox_inches="tight")
 plt.close()
 
-# ----- 6.2 Barplot основних метрик -----
+# ----- 6.2 Barplot метрик -----
 metrics_long = results_df.melt(
     id_vars="Model",
     value_vars=["Accuracy, %", "Precision, %", "Recall, %", "F1-score, %", "Balanced Accuracy, %"],
@@ -221,7 +249,7 @@ plt.tight_layout()
 plt.savefig("data/plots/metrics_comparison.png", bbox_inches="tight")
 plt.close()
 
-# ----- 6.3 ROC-криві -----
+# ----- 6.3 ROC -----
 plt.figure(figsize=(7.5, 6.5))
 for i, name in enumerate(model_names):
     y_true, _, y_proba = oof_store[name]
@@ -241,7 +269,7 @@ plt.tight_layout()
 plt.savefig("data/plots/roc_curves.png", bbox_inches="tight")
 plt.close()
 
-# ----- 6.4 Confusion matrix найкращої моделі -----
+# ----- 6.4 Confusion matrix -----
 y_true_best, y_pred_best, _ = oof_store[best_name]
 cm = confusion_matrix(y_true_best, y_pred_best)
 plt.figure(figsize=(5.8, 5))
@@ -255,13 +283,12 @@ plt.tight_layout()
 plt.savefig("data/plots/confusion_matrix_best_model.png", bbox_inches="tight")
 plt.close()
 
-# ----- 6.5 Feature importance (для tree-моделей) -----
+# ----- 6.5 Feature importance -----
 tree_models = {
     "Random Forest": models["Random Forest"],
     "XGBoost": models["XGBoost"],
     "LightGBM": models["LightGBM"],
 }
-# Навчаємо на всіх даних для importance
 fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
 for ax, (name, model) in zip(axes, tree_models.items()):
     model.fit(X, y)
@@ -276,7 +303,7 @@ plt.tight_layout()
 plt.savefig("data/plots/feature_importance.png", bbox_inches="tight")
 plt.close()
 
-# ----- 6.6 Learning curve (найкраща модель) -----
+# ----- 6.6 Learning curve -----
 best_model = models[best_name]
 train_sizes, train_scores, val_scores = learning_curve(
     best_model, X, y,
@@ -310,16 +337,16 @@ plt.close()
 pre_cols = [c for c in feature_cols if c.startswith("pre_")]
 n = len(pre_cols)
 ncols = 3
-nrows = int(np.ceil(n / ncols))
+nrows = int(np.ceil(max(n, 1) / ncols))
 fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.2 * nrows))
-axes = axes.flatten()
+axes = np.array(axes).flatten()
 for i, col in enumerate(pre_cols):
     sns.histplot(data=df, x=col, hue="recovery_success", bins=25,
                  palette={0: "#e74c3c", 1: "#27ae60"}, ax=axes[i],
                  alpha=0.65, element="step", common_norm=False)
     axes[i].set_title(col)
     axes[i].set_xlabel("")
-for j in range(i + 1, len(axes)):
+for j in range(len(pre_cols), len(axes)):
     axes[j].set_visible(False)
 plt.suptitle("Розподіл pre-метрик за результатом відновлення", fontweight="bold", y=1.01)
 plt.tight_layout()
@@ -337,33 +364,53 @@ plt.tight_layout()
 plt.savefig("data/plots/recovery_time_by_scenario.png", bbox_inches="tight")
 plt.close()
 
-# ----- 6.9 DSR summary card -----
-fig, ax = plt.subplots(figsize=(7, 3.5))
+# ----- 6.9 DSR / Policy SR / Regret summary card -----
+fig, ax = plt.subplots(figsize=(8, 4.2))
 ax.axis("off")
-text = (
-    f"Найкраща модель: {best_name}\n\n"
-    f"Predictive F1-score:     {best_f1*100:.2f}%\n"
-    f"DSR (expected_decision): {dsr_decision:.2f}%\n"
-    f"DSR (actual success):    {dsr_actual:.2f}%\n"
-    f"Кількість інцидентів:    {n_groups}\n"
-    f"Середня P(success):      {best_actions['pred_proba'].mean():.3f}"
-)
-ax.text(0.05, 0.95, text, transform=ax.transAxes, fontsize=13,
-        verticalalignment="top", fontfamily="monospace",
+lines = [
+    f"Best model: {best_name}",
+    f"",
+    f"DSR (match expected_decision):  {dsr_policy_match:.2f}%",
+    f"DSR (actual success of chosen): {dsr_actual:.2f}%",
+    f"Policy SR (success of π_ref):   {policy_sr:.2f}%",
+    f"Regret (Policy SR − DSR_act):   {regret_pp:+.2f} pp",
+    f"",
+    f"Incident groups: {n_groups}",
+    f"Mean P̂(chosen action): {mean_p:.3f}",
+    f"Brier score: {brier_best:.4f}",
+]
+ax.text(0.05, 0.95, "\n".join(lines), transform=ax.transAxes,
+        fontsize=13, verticalalignment="top", fontfamily="monospace",
         bbox=dict(boxstyle="round", facecolor="#f8f9fa", edgecolor="#2c3e50", lw=1.5))
-ax.set_title("Decision-level Performance Summary", fontweight="bold", pad=8)
+ax.set_title("Decision-level summary", fontweight="bold", pad=8)
 plt.tight_layout()
 plt.savefig("data/plots/dsr_summary.png", bbox_inches="tight")
 plt.close()
 
+# ----- 6.10 Reliability diagram (calibration check) -----
+from sklearn.calibration import calibration_curve
+
+plt.figure(figsize=(6.5, 6))
+for i, name in enumerate(model_names):
+    y_true, _, y_proba = oof_store[name]
+    frac_pos, mean_pred = calibration_curve(y_true, y_proba, n_bins=8, strategy="quantile")
+    plt.plot(mean_pred, frac_pos, "o-", color=palette[i], label=name)
+plt.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.6, label="Ideal")
+plt.xlabel("Mean predicted probability")
+plt.ylabel("Fraction of positives")
+plt.title("Reliability diagram (calibration)")
+plt.legend(loc="lower right")
+plt.grid(alpha=0.25)
+plt.tight_layout()
+plt.savefig("data/plots/reliability_diagram.png", bbox_inches="tight")
+plt.close()
+
 print(f"\n[INFO] Усі графіки збережено у: {os.path.abspath('data/plots')}")
-print("  • table1_model_comparison.png")
-print("  • metrics_comparison.png")
-print("  • roc_curves.png")
-print("  • confusion_matrix_best_model.png")
-print("  • feature_importance.png")
-print("  • learning_curve.png")
-print("  • pre_metrics_histograms.png")
-print("  • recovery_time_by_scenario.png")
-print("  • dsr_summary.png")
+for name in [
+    "table1_model_comparison.png", "metrics_comparison.png", "roc_curves.png",
+    "confusion_matrix_best_model.png", "feature_importance.png", "learning_curve.png",
+    "pre_metrics_histograms.png", "recovery_time_by_scenario.png",
+    "dsr_summary.png", "reliability_diagram.png",
+]:
+    print(f"  • {name}")
 print("\n[INFO] Пайплайн завершено успішно!")
